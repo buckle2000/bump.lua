@@ -1,5 +1,5 @@
 local bump = {
-  _VERSION     = 'bump v3.1.3',
+  _VERSION     = 'bump v3.1.6',
   _URL         = 'https://github.com/kikito/bump.lua',
   _DESCRIPTION = 'A collision detection library for Lua',
   _LICENSE     = [[
@@ -174,7 +174,7 @@ local function rect_detectCollision(x1,y1,w1,h1, x2,y2,w2,h2, goalX, goalY)
       tx, ty = x1 + px, y1 + py
     else
       -- intersecting and moving - move in the opposite direction
-      local ti1
+      local ti1, _
       ti1,_,nx,ny = rect_getSegmentIntersectionIndices(x,y,w,h, 0,0,dx,dy, -math.huge, 1)
       if not ti1 then return end
       tx, ty = x1 + dx * ti1, y1 + dy * ti1
@@ -192,6 +192,11 @@ local function rect_detectCollision(x1,y1,w1,h1, x2,y2,w2,h2, goalX, goalY)
     itemRect  = {x = x1, y = y1, w = w1, h = h1},
     otherRect = {x = x2, y = y2, w = w2, h = h2}
   }
+end
+
+-- in the shadow of at least one side of rect
+local function rect_isInShadow(x,y,w,h,px,py)
+  return (x<=px and px<=x+w) or (y<=py and py<=y+h)
 end
 
 ------------------------------------------
@@ -262,12 +267,10 @@ end
 ------------------------------------------
 
 local touch = function(world, col, x,y,w,h, goalX, goalY, filter)
-  local touch = col.touch
-  return touch.x, touch.y, {}, 0
+  return col.touch.x, col.touch.y, {}, 0
 end
 
 local cross = function(world, col, x,y,w,h, goalX, goalY, filter)
-  local touch = col.touch
   local cols, len = world:project(col.item, x,y,w,h, goalX, goalY, filter)
   return goalX, goalY, cols, len
 end
@@ -276,8 +279,8 @@ local slide = function(world, col, x,y,w,h, goalX, goalY, filter)
   goalX = goalX or x
   goalY = goalY or y
 
-  local touch, move  = col.touch, col.move
-  local sx, sy       = touch.x, touch.y
+  local tch, move  = col.touch, col.move
+  local sx, sy     = tch.x, tch.y
   if move.x ~= 0 or move.y ~= 0 then
     if col.normal.x == 0 then
       sx = goalX
@@ -288,7 +291,7 @@ local slide = function(world, col, x,y,w,h, goalX, goalY, filter)
 
   col.slide = {x = sx, y = sy}
 
-  x,y          = touch.x, touch.y
+  x,y          = tch.x, tch.y
   goalX, goalY = sx, sy
   local cols, len  = world:project(col.item, x,y,w,h, goalX, goalY, filter)
   return goalX, goalY, cols, len
@@ -298,23 +301,57 @@ local bounce = function(world, col, x,y,w,h, goalX, goalY, filter)
   goalX = goalX or x
   goalY = goalY or y
 
-  local touch, move = col.touch, col.move
-  local tx, ty = touch.x, touch.y
+  local tch, move = col.touch, col.move
+  local tx, ty = tch.x, tch.y
 
-  local bx, by, bnx, bny = tx, ty, 0,0
+  local bx, by = tx, ty
 
   if move.x ~= 0 or move.y ~= 0 then
-    bnx, bny = goalX - tx, goalY - ty
+    local bnx, bny = goalX - tx, goalY - ty
     if col.normal.x == 0 then bny = -bny else bnx = -bnx end
     bx, by = tx + bnx, ty + bny
   end
 
   col.bounce   = {x = bx,  y = by}
-  x,y          = touch.x, touch.y
+  x,y          = tch.x, tch.y
   goalX, goalY = bx, by
 
   local cols, len    = world:project(col.item, x,y,w,h, goalX, goalY, filter)
   return goalX, goalY, cols, len
+end
+
+local bypass = function(world, col, x,y,w,h, goalX, goalY, filter)
+  local other = col.otherRect
+  local item_x, item_y = col.touch.x, col.touch.y                                                -- position when touch
+  local item_center_x, item_center_y = item_x + w/2, item_y + h/2                                -- center of `item` when touch
+  local remain_x, remain_y = abs(goalX - item_x), abs(goalY - item_y)                          -- distance form touch to goal
+  -- if the object moves *diagonally* or walks straight *into* col.other
+  if (remain_x ~= 0 and remain_y ~= 0) or rect_isInShadow(other.x, other.y, other.w, other.h, item_center_x, item_center_y) then
+  	-- then just slide
+	return slide(world, col, x,y,w,h, goalX, goalY, defaultFilter)
+  else
+  	-- elsewise, first calculate dx and dy
+    local other_corner_x, other_corner_y
+      = rect_getNearestCorner(other.x, other.y, other.w, other.h, item_center_x, item_center_y)  -- nearest corner of col.other to center of `item`
+    local item_corner_x, item_corner_y
+      = rect_getNearestCorner(item_x, item_y, w, h, other_corner_x, other_corner_y)              -- nearest corner of col.item to `other`
+    local dx, dy = other_corner_x - item_corner_x, other_corner_y - item_corner_y                -- tangential distance to move in order move aside to `other`
+   	-- and then move
+    if col.normal.y == 0 then
+      dx = remain_x - abs(dy)
+      if dx < 0 then  -- can't `item` move aside completely in this frame/update?
+        dy = sign(dy) * remain_x
+        dx = 0
+      end
+    else
+      dy = remain_y - abs(dx)
+      if dy < 0 then  -- can't `item` move aside completely in this frame/update?
+        dx = sign(dx) * remain_y
+        dy = 0
+      end
+    end
+    return slide(world, col, col.touch.x, col.touch.y, w, h, col.touch.x + dx, col.touch.y + dy, filter)
+  end
 end
 
 ------------------------------------------
@@ -541,6 +578,8 @@ end
 
 function World:queryRect(x,y,w,h, filter)
 
+  assertIsRect(x,y,w,h)
+
   local cl,ct,cw,ch = grid_toCellRect(self.cellSize, x,y,w,h)
   local dictItemsInCellRect = getDictItemsInCellRect(self, cl,ct,cw,ch)
 
@@ -696,9 +735,9 @@ function World:check(item, goalX, goalY, filter)
   filter = filter or defaultFilter
 
   local visited = {[item] = true}
-  local visitedFilter = function(item, other)
+  local visitedFilter = function(itm, other)
     if visited[other] then return false end
-    return filter(item, other)
+    return filter(itm, other)
   end
 
   local cols, len = {}, 0
@@ -742,10 +781,9 @@ bump.newWorld = function(cellSize)
     responses = {}
   }, World_mt)
 
-  world:addResponse('touch', touch)
-  world:addResponse('cross', cross)
-  world:addResponse('slide', slide)
-  world:addResponse('bounce', bounce)
+  for name,response_func in pairs(bump.responses) do
+    world:addResponse(name, response_func)
+  end
 
   return world
 end
@@ -757,14 +795,16 @@ bump.rect = {
   containsPoint                 = rect_containsPoint,
   isIntersecting                = rect_isIntersecting,
   getSquareDistance             = rect_getSquareDistance,
-  detectCollision               = rect_detectCollision
+  detectCollision               = rect_detectCollision,
+  isInShadow                    = rect_isInShadow,
 }
 
 bump.responses = {
   touch  = touch,
   cross  = cross,
   slide  = slide,
-  bounce = bounce
+  bounce = bounce,
+  bypass = bypass,
 }
 
 return bump
